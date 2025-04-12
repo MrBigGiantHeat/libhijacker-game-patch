@@ -168,7 +168,7 @@ UniquePtr<Hijacker> Spawner::bootstrap(Hijacker &hijacker) {
 		if (res.state == -1) {
 			printf("spawn failed err: %s\n", strerror(res.err));
 		} else if (res.state > 1) {
-			printf("spawn failed %lld\n", res.state);
+			printf("spawn failed %d\n", res.state);
 		} else {
 			printf("spawn failed state: %llx err: 0x%llx\n", (unsigned long long) res.state, (unsigned long long) res.err);
 		}

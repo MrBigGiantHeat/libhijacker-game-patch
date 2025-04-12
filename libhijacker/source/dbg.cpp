@@ -1,10 +1,8 @@
-#include "dbg.hpp"
+#include "dbg/args.hpp"
 #include "dbg/dbg.hpp"
 #include "hijacker/hijacker.hpp"
-#include "kernel.hpp"
 #include "nid.hpp"
 #include "util.hpp"
-#include <stdarg.h>
 
 extern "C" {
 #include <ps5/kernel.h>
@@ -93,7 +91,7 @@ static void logState(const DbgArg3 &arg) {
 	if (state == 7 || state == 0) {
 		puts("idk what this means other than we're screwed");
 	}
-	printf("state: 0x%08llx\n", state);
+	printf("state: 0x%08lx\n", state);
 	// NOLINTEND(*)
 }
 
@@ -260,6 +258,50 @@ int Tracer::setsockopt(int s, int level, int optname, const void *optval, unsign
 	if (err < 0) {
 		return err;
 	}
+	return 0;
+}
+
+//int sys_dynlib_load_prx(const char* prxPath, int* moduleID){
+//	return syscall<int, const char*, int, int*, int>(0x252, prxPath, 0, moduleID, 0);
+//}
+
+
+int Tracer::dynlib_load_prx(const char *path, int *handle) const noexcept {
+    const Registers backup = getRegisters();
+    Registers jmp = backup;
+    const auto h = jmp.rsp() - sizeof(int);
+    const auto pathLength = strlen(path) + 1;
+    const auto rsp = jmp.rsp() - pathLength;
+    dbg::write(pid, rsp, path, pathLength);
+    jmp.rax(0x252);
+    jmp.rdi(rsp);
+    jmp.rsi(0);
+    jmp.rdx(h);
+    int err = static_cast<int>(syscall(backup, jmp));
+	printf("err: %i\n", err);
+    if (err != 0) {
+        return err;
+    }
+    dbg::read(pid, h, handle, sizeof(int));
+    return 0;
+}
+
+int Tracer::dynlib_dlsym(int handle, const char *name, void **address) const noexcept {
+	const Registers backup = getRegisters();
+	Registers jmp = backup;
+	const auto rsp = jmp.rsp() - sizeof(void *);
+	const auto nameLength = strlen(name) + 1;
+	const auto rsp2 = rsp - nameLength;
+	dbg::write(pid, rsp2, name, nameLength);
+	jmp.rax(0x24f);
+	jmp.rdi(handle);
+	jmp.rsi(rsp2);
+	jmp.rdx(rsp);
+	int err = static_cast<int>(syscall(backup, jmp));
+	if (err < 0) {
+		return err;
+	}
+	dbg::read(pid, rsp, address, sizeof(void *));
 	return 0;
 }
 
