@@ -34,20 +34,20 @@ jobs:
         submodules: recursive
         fetch-depth: 0
 
-    # - name: Checkout PS5SDK
-    #   uses: actions/checkout@main
-    #   with:
-    #     repository: illusion0001/PS5SDK
-    #     ref: nand-clang-16
-    #     path: ${{ env.PS5SDK }}
-
-    - name: Checkout private repository
-      uses: actions/checkout@v4
+    - name: Checkout PS5SDK
+      uses: actions/checkout@main
       with:
-        repository: MrBigGiantHeat/SDK
-        ref: test  # or whatever branch/tag you want
-        token: ${{ secrets.TOPSECRET }}
-        path: ${{ env.PS5SDK }}  # optional, where to place the repo
+        repository: illusion0001/PS5SDK
+        ref: nand-clang-16
+        path: ${{ env.PS5SDK }}
+
+    # - name: Checkout private repository
+    #   uses: actions/checkout@v4
+    #   with:
+    #     repository: MrBigGiantHeat/SDK
+    #     ref: test  # or whatever branch/tag you want
+    #     token: ${{ secrets.TOPSECRET }}
+    #     path: ${{ env.PS5SDK }}  # optional, where to place the repo
 
     - name: Set commit version
       run: |
