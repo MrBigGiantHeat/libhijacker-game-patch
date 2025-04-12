@@ -3,7 +3,6 @@
 
 extern "C" {
 	#include <ps5/kernel.h>
-size_t	 strnlen(const char *, size_t);
 }
 
 static constexpr size_t BUF_SIZE = 0x10;

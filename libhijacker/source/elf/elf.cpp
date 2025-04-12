@@ -17,7 +17,6 @@ extern "C" {
 	#include <stdint.h>
 	#include <sys/elf64.h>
 	#include <ps5/payload_main.h>
-
 	int puts(const char *);
 	int usleep(unsigned int useconds);
 	uintptr_t mmap(uintptr_t, size_t, int, int, int, off_t);
@@ -32,8 +31,6 @@ extern "C" {
 	extern const int _rw_pipe[2];
 	extern const uint64_t _pipe_addr;
 }
-
-#include "nid_resolver/resolver.h"
 
 #ifndef IPV6_2292PKTOPTIONS
 #define IPV6_2292PKTOPTIONS 25 // NOLINT(*)
@@ -57,6 +54,137 @@ constexpr uintptr_t MAP_FAILED = ~0ULL;
 
 };
 
+struct NidKeyValue {
+	Nid nid; 		// packed to fit in 12 bytes
+	uint32_t index; // index into symtab (which is a 32 bit integer)
+	constexpr int_fast64_t operator<=>(const Nid &rhs) const {
+		return nid <=> rhs;
+	}
+}; // total size is 16 bytes to allow a memcpy size of a multiple of 16
+
+class NidMap {
+	// this implementation is stupid
+	// don't try this one at home
+
+	friend struct SymbolLookupTable;
+
+	UniquePtr<NidKeyValue[]> nids;
+	uint_fast32_t size;
+	// there is no intention of ever growing this since the symtab size is known
+
+	int_fast64_t binarySearch(const Nid &key) const {
+		int_fast64_t lo = 0;
+		int_fast64_t hi = static_cast<int_fast64_t>(size) - 1;
+
+		while (lo <= hi) {
+			const auto m = (lo + hi) >> 1;
+			const auto n = nids[m].nid <=> key;
+
+			if (n == 0) [[unlikely]] {
+				return m;
+			}
+
+			if (n < 0)
+				lo = m + 1;
+			else
+				hi = m - 1;
+		}
+		return -(lo + 1);
+	}
+
+	static int_fast64_t toIndex(int_fast64_t i) {
+		return -(i + 1);
+	}
+
+	NidKeyValue &insert(const Nid &key, uint_fast32_t i) {
+		if (size++ == i) [[unlikely]] {
+			// append
+			NidKeyValue &value = nids[i];
+			value.nid = key;
+			return value;
+		}
+		__builtin_memcpy(nids.get() + i + 1, nids.get() + i, sizeof(NidKeyValue) * (size - i));
+		NidKeyValue &value = nids[i];
+		value.nid = key;
+		return value;
+	}
+
+	NidKeyValue &insert(const Nid &key) {
+		auto index = binarySearch(key);
+		if (index < 0) {
+			return insert(key, toIndex(index));
+		}
+		return nids[index];
+	}
+
+	NidMap(decltype(nullptr)) : nids(nullptr), size() {}
+	NidMap(uint_fast32_t capacity) : nids(new NidKeyValue[capacity]()), size(0) {}
+	NidMap &operator=(uint_fast32_t capacity) {
+		nids = new NidKeyValue[capacity]();
+		return *this;
+	}
+	uint_fast32_t length() const { return size; }
+
+	const NidKeyValue *operator[](const Nid &key) const {
+		auto index = binarySearch(key);
+		if (index < 0) {
+			return nullptr;
+		}
+		return nids.get() + index;
+	}
+};
+
+struct SymbolLookupTable {
+
+	NidMap nids;
+	UniquePtr<SharedLib> lib;
+
+	void fillTable() {
+		const rtld::ElfSymbolTable &symbols = lib->getMetaData()->getSymbolTable();
+		const auto len = symbols.length();
+		// remember to skip the first null symbol
+		for (size_t i = 1; i < len; i++) {
+			const auto sym = symbols[i];
+			auto &kv = nids.insert(sym.nid());
+			kv.index = i;
+		}
+	}
+
+	public:
+		SymbolLookupTable() : nids(nullptr), lib(nullptr) {}
+		SymbolLookupTable(SharedLib *lib) :
+			// while not obvious, nchain == length of symtab
+			nids(lib->getMetaData()->nSymbols()), lib(lib){}
+
+		SymbolLookupTable &operator=(SharedLib *lib) {
+			nids = lib->getMetaData()->nSymbols();
+			this->lib = lib;
+			return *this;
+		}
+
+		const rtld::ElfSymbol operator[](const Nid &nid) {
+			auto *value = nids[nid];
+			if (value == nullptr) [[unlikely]] {
+				return nullptr;
+			}
+			return lib->getMetaData()->getSymbolTable()[value->index];
+		}
+
+		const rtld::ElfSymbol operator[](const char *sym) {
+			Nid nid; // NOLINT(cppcoreguidelines-pro-type-member-init) we're initializing it in fillNid
+			fillNid(nid, sym);
+			return (*this)[nid];
+		}
+
+		explicit operator bool() const {
+			return lib != nullptr;
+		}
+
+		size_t length() const {
+			return nids.length();
+		}
+};
+
 Elf::~Elf() noexcept {
 	// tracer detaches on destruction and the loaded elf runs
 } // must be defined after SymbolLookupTable
@@ -66,28 +194,12 @@ Elf::Elf(Hijacker *hijacker, uint8_t *data) noexcept :
 		phdrs(reinterpret_cast<Elf64_Phdr*>(data + e_phoff)), strtab(),
 		strtabLength(), symtab(), symtabLength(), relatbl(), relaLength(),
 		plt(), pltLength(), hijacker(hijacker), textOffset(), imagebase(),
-		data(data), resolver(nullptr), mappedMemory(nullptr), jitFd(-1) {
+		data(data), libs(nullptr), mappedMemory(nullptr), jitFd(-1) {
 	// TODO check the elf magic stupid
 	//hexdump(data, sizeof(Elf64_Ehdr));
 }
 
-bool loadLibraries(Hijacker &hijacker, dbg::Tracer &tracer, const Array<String> &paths, ManagedResolver &resolver) noexcept;
-
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-
-extern "C" int _write(int, const void*, size_t);
-
-void log_to_file(const char *msg) {
-	int fd = open("/data/prelf1.log", O_WRONLY | O_CREAT | O_APPEND, 0777);
-	if (fd < 0) {
-		return;
-	}
-	_write(fd, msg, __builtin_strlen(msg));
-	close(fd);
-	printf("[ELF_LOADER] %s", msg);
-}
+bool loadLibraries(Hijacker &hijacker, const dbg::Tracer &tracer, const Array<String> &paths, Array<SymbolLookupTable> &libs, const size_t reserved) noexcept;
 
 bool Elf::parseDynamicTable() noexcept {
 	const Elf64_Dyn *__restrict dyntbl = nullptr;
@@ -100,7 +212,7 @@ bool Elf::parseDynamicTable() noexcept {
 	}
 
 	if (dyntbl == nullptr) [[unlikely]] {
-		log_to_file("dynamic table not found\n");
+		puts("dynamic table not found");
 		return false;
 	}
 
@@ -154,37 +266,33 @@ bool Elf::parseDynamicTable() noexcept {
 		}
 	}
 
-	log_to_file("after switch\n");
-
 	if (strtab == nullptr) [[unlikely]] {
-	    log_to_file("strtab not found\n");
-
+		puts("strtab not found");
 	}
 
 	if (strtabLength == 0 && strtab != nullptr) [[unlikely]] {
-		log_to_file("strtab size not found but strtab exists\n");
+		puts("strtab size not found but strtab exists");
 		return false;
 	}
 
 	if (symtabLength == 0) [[unlikely]] {
-		log_to_file("symtab size not found\n");
+		puts("symtab size not found");
 	}
 
 	if (symtab == nullptr) [[unlikely]] {
-		log_to_file("symtab not found\n");
+		puts("symtab not found");
 	}
 
 	if (relatbl == nullptr) [[unlikely]] {
-		log_to_file("rela table not found\n");
+		puts("rela table not found");
 	}
 
 	if (plt == nullptr) [[unlikely]] {
-		log_to_file("plt table not found\n");
+		puts("plt table not found");
 	}
 
 	if (symtab == nullptr || strtab == nullptr) [[unlikely]] {
 		// don't need to proceed
-		log_to_file("symtab or strtab not found\n");
 		return true;
 	}
 
@@ -197,7 +305,6 @@ bool Elf::parseDynamicTable() noexcept {
 		StringView filename = strtab + lib->d_un.d_val;
 		if (!filename.endswith(".so"_sv)) [[unlikely]] {
 			__builtin_printf("unexpected library 0x%llx %s\n", (unsigned long long)lib->d_un.d_val, filename.c_str());
-			log_to_file("unexpected library\n");
 			return false;
 		}
 		// I really do not want to implement a hashmap
@@ -217,42 +324,31 @@ bool Elf::parseDynamicTable() noexcept {
 		names[i++] = StringView{filename.c_str(), filename.length() - 3};
 	}
 
-	log_to_file("after loop\n");
-
 	// remove unset values
 	names.shrink(i);
-	log_to_file("after shrink\n");
 
-	resolver = new ManagedResolver{};
-
-	resolver->reserve_library_memory(handleCount + names.length());
-
-	log_to_file("after reserve\n");
-
-	log_to_file("filling symbol tables\n");
-	for (auto i = 0; i < handleCount; i++) {
-		auto ptr = hijacker->getLib(preLoadedHandles[i]);
-		if (ptr == nullptr) [[unlikely]] {
-			printf("failed to get lib for 0x%x\n", (unsigned int) preLoadedHandles[i]);
-			log_to_file("failed to get lib\n");
-			return false;
-		}
-		if (resolver->add_library_metadata(ptr->imagebase(), ptr->getMetaDataAddress()) != 0) {
-			printf("failed to add library metadata for 0x%x\n", (unsigned int) preLoadedHandles[i]);
-			log_to_file("failed to add library metadata\n");
-			return false;
-		}
-	}
+	libs = {handleCount + names.length()};
 
 	if (names.length() > 0) {
-		log_to_file("loading libraries\n");
-		if (!loadLibraries(*hijacker, tracer, names, *resolver)) {
+		puts("loading libraries");
+		if (!loadLibraries(*hijacker, tracer, names, libs, handleCount)) {
 			__builtin_printf("failed to load libraries\n");
 			return false;
 		}
 	}
 
-	log_to_file("finished process dynamic table\n");
+	puts("filling symbol tables");
+	for (auto i = 0; i < handleCount; i++) {
+		auto ptr = hijacker->getLib(preLoadedHandles[i]);
+		if (ptr == nullptr) [[unlikely]] {
+			printf("failed to get lib for 0x%x\n", (unsigned int) preLoadedHandles[i]);
+			return false;
+		}
+		SymbolLookupTable &lib = libs[i] = ptr.release();
+		lib.fillTable();
+	}
+
+	puts("finished process dynamic table");
 	return true;
 }
 
@@ -300,42 +396,35 @@ static constexpr int PROT_EXEC = 4;
 static constexpr int PROT_GPU_READ = 0x10;
 static constexpr int PROT_GPU_WRITE = 0x20;
 
-static bool loadLibrariesInplace(Hijacker &hijacker, const Array<String> &names, ManagedResolver &resolver) noexcept {
+static bool loadLibrariesInplace(Hijacker &hijacker, const Array<String> &names, Array<SymbolLookupTable> &libs, const size_t reserved) noexcept {
 	for (const auto &name : names) {
 		const auto id = SYSMODULES[name];
 		int handle = id != 0 ? sceSysmoduleLoadModuleInternal(id) :
 			sceSysmoduleLoadModuleByNameInternal(name.c_str(), 0, 0, 0, 0, 0);
 		if (handle == -1) {
 			printf("failed to get lib handle for %s\n", name.c_str());
-			log_to_file("failed to get lib handle\n");
 			return false;
 		}
 	}
-
-	log_to_file("after loadLibrariesInplace\n");
 
 	const auto nlibs = names.length();
 	for (size_t i = 0; i < nlibs; i++) {
 		auto ptr = hijacker.getLib(names[i]);
 		if (ptr == nullptr) [[unlikely]] {
 			printf("failed to get lib handle for %s\n", names[i].c_str());
-			log_to_file("failed to get lib handle\n");
 			return false;
 		}
-		if (resolver.add_library_metadata(ptr->imagebase(), ptr->getMetaDataAddress()) != 0) {
-			printf("failed to add library metadata for %s\n", names[i].c_str());
-			log_to_file("failed to add library metadata\n");
-			return false;
-		}
+
+		SymbolLookupTable &lib = libs[i + reserved] = ptr.release();
+		lib.fillTable();
 	}
 	return true;
 }
 
-bool loadLibraries(Hijacker &hijacker, dbg::Tracer &tracer, const Array<String> &names, ManagedResolver &resolver) noexcept {
+bool loadLibraries(Hijacker &hijacker, const dbg::Tracer &tracer, const Array<String> &names, Array<SymbolLookupTable> &libs, const size_t reserved) noexcept {
 	if (hijacker.getPid() == getpid()) {
-		return loadLibrariesInplace(hijacker, names, resolver);
+		return loadLibrariesInplace(hijacker, names, libs, reserved);
 	}
-	log_to_file("before loadLibraries\n");
 
 	static constexpr uint32_t INTERNAL_MASK = 0x80000000;
 
@@ -343,7 +432,6 @@ bool loadLibraries(Hijacker &hijacker, dbg::Tracer &tracer, const Array<String> 
 	String fulltbl{};
 	UniquePtr<uintptr_t[]> positions{new uintptr_t[nlibs]};
 	{
-		log_to_file("before loop\n");
 		size_t i = 0;
 		size_t tblSize = 0;
 		for (const String &path : names) {
@@ -362,141 +450,37 @@ bool loadLibraries(Hijacker &hijacker, dbg::Tracer &tracer, const Array<String> 
 			}
 		}
 	}
-    log_to_file("after loop w\n");
+
 	const uintptr_t strtab = hijacker.getDataAllocator().allocate(fulltbl.length() + 1);
 
 	hijacker.write(strtab, fulltbl.c_str(), fulltbl.length() + 1); // include the null terminator
-	log_to_file("after write\n");
-#if 1
-	UniquePtr<SharedLib> lib; // Declare lib here without initializing.
-	int number_of_tries = 0;
-	int handle = -1;
-	do{
-        lib = hijacker.getLib("libSceSysmodule.sprx");
-		if(lib == nullptr) printf("[1] libSceSysmodule.sprx is NULL\n");
-		number_of_tries++;
-		if(number_of_tries > 150) {
-			log_to_file("libSceSysmodule.sprx not loaded\n");
-			return false;
-		}
 
-		if(lib != nullptr) {
-			printf("[2-] libSceSysmodule.sprx is not NULL\n");
-			break;
-		}
-		tracer.dynlib_load_prx("/system/common/lib/libSceSysmodule.sprx", &handle);
-		if(handle > 0){
-			lib = hijacker.getLib(handle);
-			if(lib == nullptr) {
-				printf("getlib(handle) is NULL\n");
-			}
-			else
-			{
-				printf("getlib(handle) is not NULL\n");
-			}
-		}
-		printf("libSceSysmodule.sprx: %p, try %i, handle %x\n", lib.get(), number_of_tries, handle);
-
-		usleep(100000);
-	}while (lib == nullptr);
-
-
+	const auto &lib = hijacker.getLib("libSceSysmodule.sprx"_sv);
 	if (lib == nullptr) [[unlikely]] {
-		log_to_file("libSceSysmodule.sprx not loaded\n");
+		puts("libSceSysmodule.sprx not loaded");
 		return false;
-	}
-	else {
-		log_to_file("libSceSysmodule.sprx loaded\n");
 	}
 
 	// int sceSysmoduleLoadModuleInternal(uint32_t id);
 	const auto sceSysmoduleLoadModuleInternal = hijacker.getFunctionAddress(lib.get(), nid::sceSysmoduleLoadModuleInternal);
 	if (sceSysmoduleLoadModuleInternal == 0) [[unlikely]] {
-		log_to_file("sceSysmoduleLoadModuleInternal not found");
+		puts("sceSysmoduleLoadModuleInternal not found");
 		return false;
 	}
 
 	// int sceSysmoduleLoadModuleByNameInternal(const char *fname, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
 	const auto sceSysmoduleLoadModuleByNameInternal = hijacker.getFunctionAddress(lib.get(), nid::sceSysmoduleLoadModuleByNameInternal);
 	if (sceSysmoduleLoadModuleByNameInternal == 0) [[unlikely]] {
-		log_to_file("sceSysmoduleLoadModuleByNameInternal not found");
+		puts("sceSysmoduleLoadModuleByNameInternal not found");
 		return false;
 	}
-
-	const auto sceSysmoduleLoadModule = hijacker.getFunctionAddress(lib.get(), nid::sceSysmoduleLoadModule);
-	if (sceSysmoduleLoadModule == 0) [[unlikely]] {
-		log_to_file("sceSysmoduleLoadModule not found");
-		return false;
-	}
-#else
-    int handle = -1;
-	int ret = tracer.dynlib_load_prx("libSceSysmodule.sprx", &handle);
-	if (ret != 0 || handle == -1) [[unlikely]] {
-		printf("failed to get lib handle for libSceSysmodule.sprx, ret %i\n", ret);
-		int ret = tracer.dynlib_load_prx("/system/common/lib/libSceSysmodule.sprx", &handle);
-	    if (ret != 0 || handle == -1) [[unlikely]] {
-		  printf("failed to get lib handle for libSceSysmodule.sprx, ret %i\n", ret);
-		  return false;
-	   }
-	}
-	
-	printf("handle: 0x%X ret %i\n", handle, ret);
-
-	int (*sceSysmoduleLoadModuleInternal)(uint32_t) = nullptr;
-	int (*sceSysmoduleLoadModuleByNameInternal)(const char *fname, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t) = nullptr;
-	int(*sceSysmoduleLoadModule)(uint16_t) = nullptr;
-	if (tracer.dynlib_dlsym(handle, "sceSysmoduleLoadModuleInternal", (void**)&sceSysmoduleLoadModuleInternal) == -1) {
-		log_to_file("failed to get sceSysmoduleLoadModuleInternal\n");
-		return false;
-	}
-	if (tracer.dynlib_dlsym(handle, "sceSysmoduleLoadModuleByNameInternal", (void**)&sceSysmoduleLoadModuleByNameInternal) == -1) {
-		log_to_file("failed to get sceSysmoduleLoadModuleByNameInternal\n");
-		return false;
-	}
-	if (tracer.dynlib_dlsym(handle, "sceSysmoduleLoadModule", (void**)&sceSysmoduleLoadModule) == -1) {
-		log_to_file("failed to get sceSysmoduleLoadModule\n");
-		return false;
-	}
-
-#endif
-    
 
 	for (size_t i = 0; i < nlibs; i++) {
 		int handle = -1;
 		if (positions[i] & INTERNAL_MASK) {
-			handle = tracer.call<int>((uintptr_t)sceSysmoduleLoadModuleInternal, static_cast<uint32_t>(positions[i]));
-			printf("id: 0x%x, handle %i\n", (unsigned int)positions[i], handle);
-			String prx_path("/system/common/lib/");
-			prx_path += names[i];
-			prx_path += ".sprx";
-			tracer.dynlib_load_prx(prx_path.c_str(), &handle);
-			printf("[2] path: %s, handle %i\n", prx_path.c_str(), handle);
-			auto ptr = hijacker.getLib(handle);
-				printf("failed to get lib handle for 0x%x, handle %i\n", (unsigned int)positions[i], handle);
-				if (resolver.add_library_metadata(ptr->imagebase(), ptr->getMetaDataAddress()) != 0) {
-					printf("failed to add library metadata for %s\n", names[i].c_str());
-					return false;
-				}
-				continue;
+			handle = tracer.call<int>(sceSysmoduleLoadModuleInternal, static_cast<uint32_t>(positions[i]));
 		} else {
-			if(names[i] == "libSceMsgDialog"){
-			tracer.dynlib_load_prx("/system/common/lib/libSceMsgDialog.native.sprx", &handle);
-			printf("[2] handle %i\n", handle);
-			auto ptr = hijacker.getLib(handle);
-			if (ptr == nullptr) [[unlikely]] {
-				printf("failed to get lib handle for 0x%x, handle %i\n", (unsigned int)positions[i], handle);
-				if (resolver.add_library_metadata(ptr->imagebase(), ptr->getMetaDataAddress()) != 0) {
-					printf("failed to add library metadata for %s\n", names[i].c_str());
-					return false;
-				}
-				continue;
-			}
-			}
-			else
-			   handle = tracer.call<int>((uintptr_t)sceSysmoduleLoadModuleByNameInternal, strtab + positions[i], 0, 0, 0, 0, 0);
-
-			printf("handle %i\n", handle);
-			//printf("str: %s\n", (const char*)(strtab + positions[i]));
+			handle = tracer.call<int>(sceSysmoduleLoadModuleByNameInternal, strtab + positions[i], 0, 0, 0, 0, 0);
 		}
 
 		if (handle == -1) [[unlikely]] {
@@ -504,16 +488,14 @@ bool loadLibraries(Hijacker &hijacker, dbg::Tracer &tracer, const Array<String> 
 			return false;
 		}
 
-		auto ptr = names[i] == "libSceMsgDialog" ? hijacker.getLib("libSceMsgDialog.native") :  hijacker.getLib(names[i]);
+		auto ptr = hijacker.getLib(names[i]);
 		if (ptr == nullptr) [[unlikely]] {
 			printf("failed to get lib handle for %s\n", names[i].c_str());
 			return false;
 		}
 
-		if (resolver.add_library_metadata(ptr->imagebase(), ptr->getMetaDataAddress()) != 0) {
-			printf("failed to add library metadata for %s\n", names[i].c_str());
-			return false;
-		}
+		SymbolLookupTable &lib = libs[i + reserved] = ptr.release();
+		lib.fillTable();
 	}
 
 	puts("finished loading libraries");
@@ -674,8 +656,6 @@ struct KernelRWArgs {
 static int rwpipe[2]; // NOLINT(*)
 static int rwpair[2]; // NOLINT(*)
 
-typedef int dlsym_t(int, const char*, void*);
-
 static struct InternalPayloadArgs {
 	struct payload_args args;
 	int payloadout;
@@ -687,11 +667,11 @@ static uintptr_t setupKernelRWInplace(const Hijacker& hijacker) {
 	rwpair[0] = _master_sock;
 	rwpair[1] = _victim_sock;
 	gResult.args = {
-		.sys_dynlib_dlsym = reinterpret_cast<dlsym_t*>(hijacker.getLibKernelFunctionAddress(nid::sceKernelDlsym)), // NOLINT(*)
+		.dlsym = reinterpret_cast<dlsym_t*>(hijacker.getLibKernelFunctionAddress(nid::sceKernelDlsym)), // NOLINT(*)
 		.rwpipe = rwpipe,
 		.rwpair = rwpair,
-		.kpipe_addr = static_cast<intptr_t>(_pipe_addr),
-		.kdata_base_addr = static_cast<intptr_t>(kernel_base),
+		.kpipe_addr = _pipe_addr,
+		.kdata_base_addr = kernel_base,
 		.payloadout = &gResult.payloadout
 	};
 	return reinterpret_cast<uintptr_t>(&gResult);
@@ -751,11 +731,11 @@ uintptr_t Elf::setupKernelRW() noexcept {
 
 	// NOLINTBEGIN(performance-no-int-to-ptr)
 	struct payload_args result = {
-		.sys_dynlib_dlsym = reinterpret_cast<dlsym_t *>(hijacker->getLibKernelFunctionAddress(nid::sceKernelDlsym)),
+		.dlsym = reinterpret_cast<dlsym_t *>(hijacker->getLibKernelFunctionAddress(nid::sceKernelDlsym)),
 		.rwpipe = reinterpret_cast<int *>(newFiles) + 2,
 		.rwpair = reinterpret_cast<int *>(newFiles),
-		.kpipe_addr = static_cast<intptr_t>(pipeaddr),
-		.kdata_base_addr = static_cast<intptr_t>(kernel_base),
+		.kpipe_addr = pipeaddr,
+		.kdata_base_addr = kernel_base,
 		.payloadout = reinterpret_cast<int*>(rsp + sizeof(struct payload_args))
 	};
 	// NOLINTEND(performance-no-int-to-ptr)
@@ -781,7 +761,7 @@ bool Elf::load() noexcept {
 
 		int j = 0;
 		while (!hijacker->write(vaddr, data + phdr->p_offset, phdr->p_filesz)) {
-			printf("failed to write section data for phdr with paddr 0x%08lx\n", phdr->p_paddr);
+			printf("failed to write section data for phdr with paddr 0x%08llx\n", phdr->p_paddr);
 			if (j++ > 10) { // NOLINT(cppcoreguidelines-avoid-magic-numbers)
 				// TODO: find out why I did this
 				return false;
@@ -791,58 +771,36 @@ bool Elf::load() noexcept {
 	return true;
 }
 
-
 bool Elf::launch() noexcept {
 	puts("processing program headers");
-	log_to_file( "processing program headers\n");
-
 	if (!processProgramHeaders()) [[unlikely]] {
-		log_to_file( "failed to process program headers\n");
 		return false;
 	}
-
 	puts("processing dynamic table");
-	log_to_file( "processing dynamic table\n");
-
 	if (!parseDynamicTable()) [[unlikely]] {
-		log_to_file( "failed to process dynamic table\n");
 		return false;
 	}
 	puts("processing relocations");
-	log_to_file( "processing relocations\n");
-
 	if (!processRelocations()) [[unlikely]] {
-		log_to_file( "failed to process relocations\n");
 		return false;
 	}
 	puts("processing plt relocations");
-	log_to_file( "processing plt relocation\n");
-
 	if (!processPltRelocations()) [[unlikely]] {
-		log_to_file( "failed to process plt relocations\n");
 		return false;
 	}
 
 	puts("setting up kernel rw");
-	log_to_file( "setting up kernel rw\n");
-
 	uintptr_t args = setupKernelRW();
 	if (args == 0) [[unlikely]] {
-		log_to_file( "failed to setup kernel rw\n");
 		return false;
 	}
 
 	puts("loading into memory");
-	log_to_file( "loading into memory\n");
-
 	if (!load()) [[unlikely]] {
-		log_to_file( "failed to load\n");
 		return false;
 	}
 
 	puts("starting");
-	log_to_file( "starting\n");
-
 
 	return start(args);
 }
@@ -853,7 +811,6 @@ static void correctRsp(dbg::Registers &regs) noexcept {
 }
 
 bool Elf::start(uintptr_t args) noexcept {
-	printf("imagebase: 0x%08lx\n", imagebase);
 	if (hijacker->getPid() == getpid()) {
 		auto fun = reinterpret_cast<int(*)(uintptr_t)>(imagebase + e_entry); // NOLINT(*)
 		bool res = fun(args) == 0;
@@ -866,6 +823,7 @@ bool Elf::start(uintptr_t args) noexcept {
 	(void) args;
 	dbg::Registers regs = tracer.getRegisters();
 	correctRsp(regs);
+	printf("imagebase: 0x%08llx\n", imagebase);
 	regs.rdi(args);
 	regs.rip(imagebase + e_entry);
 	tracer.setRegisters(regs);
@@ -878,7 +836,6 @@ uintptr_t Elf::getSymbolAddress(const Elf64_Rela *__restrict rel) const noexcept
 	if (symtab == nullptr || strtab == nullptr) [[unlikely]] {
 		return true;
 	}
-
 	const Elf64_Sym *__restrict sym = symtab + ELF64_R_SYM(rel->r_info);
 	if (sym->st_value != 0) {
 		// the symbol exists in our elf
@@ -886,15 +843,14 @@ uintptr_t Elf::getSymbolAddress(const Elf64_Rela *__restrict rel) const noexcept
 		// this was a mistake and I'm an idiot but it may be useful in the future
 		return imagebase + sym->st_value;
 	}
-
+	for (auto &lib : libs) {
+		auto libsym = lib[strtab + sym->st_name];
+		if (libsym && libsym.exported()) {
+			return libsym.vaddr();
+		}
+	}
 	if (ELF64_ST_BIND(sym->st_info) == STB_WEAK) {
 		return -1;
-	}
-
-	const auto libsym = resolver->lookup_symbol(strtab + sym->st_name);
-
-	if (libsym) {
-		return libsym;
 	}
 	printf("symbol lookup for %s failed\n", strtab + sym->st_name);
 	return 0;

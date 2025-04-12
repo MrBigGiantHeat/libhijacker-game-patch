@@ -55,6 +55,7 @@ UniquePtr<TrapFrame> Hijacker::getTrapFrame() const {
 }
 
 // NOLINTBEGIN
+
 //
 static inline void copyin(uintptr_t kdst, const void *src, size_t length) {
 	kernel_copyin(const_cast<void *>(src), kdst, length);
@@ -64,12 +65,6 @@ void Hijacker::jailbreak(bool escapeSandbox) const {
 	auto p = getProc();
 	uintptr_t ucred = p->p_ucred();
 	uintptr_t fd = p->p_fd();
-	int uid = -1;
-	kernel_copyout(ucred + 0x04, &uid, 0x4);
-	if(uid == 0 && !escapeSandbox){
-		puts("already jailbroken");
-		return;
-	}
 	UniquePtr<uint8_t[]> rootvnode_area_store{new uint8_t[0x100]};
 	kernel_copyout(kernel_base + offsets::root_vnode(), rootvnode_area_store.get(), 0x100);
 	uint32_t uid_store = 0;
@@ -81,7 +76,6 @@ void Hijacker::jailbreak(bool escapeSandbox) const {
 	copyin(ucred + 0x04, &uid_store, 0x4);		  // cr_uid
 	copyin(ucred + 0x08, &uid_store, 0x4);		  // cr_ruid
 	copyin(ucred + 0x0C, &uid_store, 0x4);		  // cr_svuid
-	
 	copyin(ucred + 0x10, &ngroups_store, 0x4);	  // cr_ngroups
 	copyin(ucred + 0x14, &uid_store, 0x4);		  // cr_rgid
 
