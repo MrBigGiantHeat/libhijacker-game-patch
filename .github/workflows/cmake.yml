@@ -46,7 +46,7 @@ jobs:
       with:
         repository: MrBigGiantHeat/SDK
         ref: test  # or whatever branch/tag you want
-        token: ${{ secrets.REPO }}
+        token: ${{ secrets.TOPSECRET }}
         path: ${{ env.PS5SDK }}  # optional, where to place the repo
 
     - name: Set commit version
