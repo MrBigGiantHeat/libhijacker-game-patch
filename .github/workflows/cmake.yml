@@ -86,7 +86,7 @@ jobs:
           bin/spawner.elf
           README.md
 
-    # - name: Create Release
+    # - name: Create Release@
     #   if: github.event_name == 'workflow_dispatch'
     #   env:
     #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
